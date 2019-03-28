@@ -1,0 +1,311 @@
+---
+title: "Eye-Tracking Data Analysis Sample"
+author: "Julie Gregg"
+date: "March 3, 2019"
+output: html_document
+---
+
+Background:
+
+The following script is a subset of analyses of eye-tracking data from a study on spoken word processing. Participants heard spoken instructions to click on a word and then had to select that word from an array of pictures, which included the target, a competitor (one of two types) and two distractors that were unrelated (sound- and spelling-wise) to the target. A graphic showing the basic study design is here: https://i.imgur.com/LBMSEvM.png
+
+Here we examine data from two sub-experiments of a study on how phoneme (sound) order is used to process spoken words. In this study, we use participants' eye movements to related and unrelated pictures to understand how the spoken word is processed. 
+
+The two sub-experiments were the anadrome condition and the no-vowel-position-overlap condition (abbreviated ACTCAT in this script). As the theoretical motivation behind these two sub-experiments are likely of little interest to the reviewer of this script, it is sufficient to know only that we expected a competitor/distractor difference in picture viewing preferences in the anadrome condition, but not in the ACTCAT condition.
+
+
+Analysis:
+
+For these data, we will need to do some reshaping, and then we will fit some generalized linear mixed models (GLMMs) to the data. Here we are modeling the presence/absence of a fixation (where the eye is looking) on a particular picture at a given time, so the outcome variable is binary (looking or not looking).
+
+Load in the needed libraries:
+```{r libraries, echo=FALSE}
+
+#Uncomment the package installs if any of the following packages is not already installed:
+
+#install.packages("tidyverse") 
+library(tidyverse)
+#install.packages("lme4")
+library(lme4)
+#install.packages("sjPlot")
+library(sjPlot)
+#install.packages("data.table")
+library(data.table)
+
+
+#These two libraries should be installed but do not need to be loaded as we call only single functions from them later
+#install.packages("plyr") 
+#install.packages("MASS")
+
+```
+
+Read in the data and subset to the needed columns/rows:
+```{r data}
+
+#Read in the data, which were processed in 4 batches, and bind together into one dataframe
+
+set1 <- read_csv("4_4_compiled.csv", na=".")
+set2 <- read_csv("4_13_compiled.csv", na=".")
+set3 <- read_csv("4_20_compiled.csv", na=".")
+set4 <- read_csv("4_26_compiled.csv", na=".")
+
+full <- rbind(set1, set2, set3, set4)
+
+#Remove data from 4 participants with poor eye-tracker calibrations as identified during manual post-processing 
+
+full <- full[-which(full$RECORDING_SESSION_LABEL %in% c("15shl1", "30acl1", "33shl1", "35acl2")),]
+
+#Adjust participant reaction times to timelock to the start of the spoken word 
+#These corrections are related to the duration of the instruction plus a 200 ms preview of the pictures before the spoken word began
+full$correctRT <- full$RESPONSE_RT+682+200-full$arraylatency
+
+#Replace missing with 0
+full[is.na(full)] <- 0
+
+###subset to the columns containing needed information:
+
+#RECORDING_SESSION_LABEL = participant ID
+#TRIAL_INDEX = provide a unique numeric identifier for each set of stimuli
+#IA_LABEL = which picture was fixated (target, competitor, or one of two unrelated distractors)
+#trialtype = whether the trial was in the anadrome or no-vowel-position overlap sub-experiment
+#IA_FIRST/SECOND/THIRD_RUN_START/END_TIME = start and end times for the first 3 fixations on an interest area
+#RESPONSE_ACC = whether the correct word was clicked on this trial 
+#correctRT = how long in ms it took for the participant to click on a word
+#target = the spoken word 
+#arraylatency = a correction factor to be applied to synchronize the analyses to the start of the spoken word
+
+keepcols <- c("RECORDING_SESSION_LABEL", "IA_FIRST_RUN_START_TIME", "IA_FIRST_RUN_END_TIME", "IA_SECOND_RUN_START_TIME", "IA_SECOND_RUN_END_TIME", "IA_THIRD_RUN_START_TIME", "IA_THIRD_RUN_END_TIME", "IA_LABEL", "RESPONSE_ACC", "TRIAL_INDEX", "target", "correctRT", "trialtype", "arraylatency") #column names can be added/removed here as needed
+
+EyeData <- full[, which(colnames(full) %in% keepcols)]
+
+#Subset to the experimental trials only by removing practice and fillers
+EyeData <- EyeData %>% filter(trialtype!="Practice" & trialtype!="Filler")
+
+#Relabel key variables to be more transparent
+colnames(EyeData)[which(colnames(EyeData) %in% "RECORDING_SESSION_LABEL")] <- "ParticipantID"
+colnames(EyeData)[which(colnames(EyeData) %in% "IA_LABEL")] <- "Picture_Type"
+
+#Remove unneeded objects from  workspace to conserve memory
+rm(full, set1,set2,set3,set4)
+
+#In order to analyze these data, we need to reconstruct the time series of which (if any) of the pictures the participant was looking at during a given window
+
+#Identify the start and end times for first, second, and third run fixations on this trial, considering only fixations that occurred once the trial started (account for a 1000 ms waiting period before the trial began)
+
+EyeData$Fststart <- ifelse(EyeData$IA_FIRST_RUN_START_TIME <= (1000+EyeData$arraylatency), 0, EyeData$IA_FIRST_RUN_START_TIME-(1000+EyeData$arraylatency))
+EyeData$Fstend <- ifelse(EyeData$IA_FIRST_RUN_START_TIME <= 0, 0, EyeData$IA_FIRST_RUN_END_TIME - (1000+EyeData$arraylatency))
+EyeData$Secstart <- ifelse(EyeData$IA_SECOND_RUN_START_TIME <= (1000+EyeData$arraylatency), 0, EyeData$IA_SECOND_RUN_START_TIME-(1000+EyeData$arraylatency))
+EyeData$Secend <- ifelse(EyeData$IA_SECOND_RUN_START_TIME <= 0, 0, EyeData$IA_SECOND_RUN_END_TIME - (1000+EyeData$arraylatency))
+EyeData$Thirdstart <- ifelse(EyeData$IA_THIRD_RUN_START_TIME <= (1000+EyeData$arraylatency), 0, EyeData$IA_THIRD_RUN_START_TIME-(1000+EyeData$arraylatency))
+EyeData$Thirdend <- ifelse(EyeData$IA_THIRD_RUN_START_TIME <= 0, 0, EyeData$IA_THIRD_RUN_END_TIME - (1000+EyeData$arraylatency))
+
+#Not all targets were successfully chosen
+mean(EyeData$RESPONSE_ACC)
+
+#We subset to only the correctly-identified trials for this analysis
+#We also remove a poorly visually-matched picture set here which led to unusual eye movement behavior
+
+CorrectEyeData <- EyeData %>% filter(RESPONSE_ACC==1 & target!="ride.jpg" & target!="dry.jpg")
+
+#Remove unneeded object
+rm(EyeData)
+
+#Tidy up columns again
+keepclean <- c("ParticipantID", "target", "Picture_Type", "trialtype","TRIAL_INDEX", "Fststart", "Fstend", "Secstart", "Secend", "Thirdstart", "Thirdend")
+
+CorrectEyeData <- CorrectEyeData[, which(colnames(CorrectEyeData) %in% keepclean)]
+
+```
+
+
+Our eye-tracking output summarizes up to the third fixation on each picture. In order to visualize and analyze the data, we need to reconstruct the whole time series of looks throughout the relevant parts of each trial. To do this, we segment the relevant time window into time bins and reconstruct which picture, if any, was being viewed at each time.  
+```{r bins}
+#Maxbin and binsize are updated here and called using these variable names so that different time windows and bin sizes can be tried without making changes throughout the code
+maxbin = 1500
+binsize = 50
+
+#Generate full list of time bins between 0 and maxbin
+timebins <- seq(0, maxbin, by=binsize)
+tmatrix <- matrix(nrow=nrow(CorrectEyeData), ncol=length(timebins))
+
+#Generate time vectors for each row and column for first, second, and third fixations on each picture
+
+
+
+for(i in 1:nrow(tmatrix)) {
+for(j in 1:length(timebins)) {
+
+tmatrix[i,j] <-  ifelse(CorrectEyeData$Fststart[i] < timebins[j] & 
+                CorrectEyeData$Fstend[i] > timebins[j] |CorrectEyeData$Secstart[i] <
+                timebins[j] & CorrectEyeData$Secend[i] > timebins[j] | CorrectEyeData$Thirdstart[i] 
+                < timebins[j] & CorrectEyeData$Thirdend[i]>timebins[j], 1,0)
+} 
+}
+
+#Combine the cleaned eye data with the time matrix
+CleanData<- cbind(CorrectEyeData, data.frame(tmatrix))
+
+#Assign time values to time bin columns
+colnames(CleanData)[(ncol(CorrectEyeData)+1):(ncol(CorrectEyeData)+length(timebins))] <- seq(0, maxbin, by=binsize)
+
+#Put the data into long  format
+CleanData<- CleanData %>% gather(timebins,value,((ncol(CorrectEyeData)+1):ncol(CleanData)))
+
+#change time into numeric and subset to a reasonable time period starting at word onset and ending 1.2 seconds later (~ the average response time)
+
+CleanData$timebins<-as.numeric(as.character(CleanData$timebins)) #Convert time to numeric
+
+#Perform a final correction to remove a 200 ms picture preview period before the spoken word began
+CleanData$time<-CleanData$timebins-200
+CleanDataSubset<-CleanData %>% filter(time>=0 & time <=1200)
+
+#Take smaller subset of useful columns
+CleanDataSubset <- CleanDataSubset[, which(colnames(CleanDataSubset) %in% c("ParticipantID", "Picture_Type", "trialtype", "target", "time", "value"))]
+
+#Clean up
+
+rm(CorrectEyeData, tmatrix)
+```
+
+
+Now we can visualize which picture participants looked at over time for each sub-experiment.
+```{r figure}
+
+CleanDataFigure <- CleanDataSubset #Make a copy  because we are averaging some conditions for the figure that we do not want to average for the analysis
+
+#Average the distractors for the sake of visualization - we begin by giving both unrelated pictures the same label
+CleanDataFigure$Picture_Type <- ifelse(CleanDataFigure$Picture_Type=="TARGET_IA", "TARGET_IA", ifelse(CleanDataFigure$Picture_Type=="COMPET_IA", "COMPET_IA", "UNREL_IA"))
+
+#Average across labels so there is only one value for distractors
+
+CleanDataFigure<-CleanDataFigure %>%
+    group_by(ParticipantID, Picture_Type, trialtype, target, time) %>%
+    summarise(value=mean(value))
+
+#Average over participant and 95% CIs for the figures
+ParticipantLevel<-CleanDataFigure %>%
+    group_by(Picture_Type, trialtype, time) %>%
+    summarise(n=n(),Prob=mean(value),sd=sd(value)) %>%
+    mutate(se=sd/sqrt(n), LCI=Prob+qnorm(0.025)*se, UCI=Prob+qnorm(0.975)*se)
+
+ParticipantLevel$time<-as.numeric(as.character(ParticipantLevel$time)) #Make sure time is numeric
+ParticipantLevel$Picture_Type <- factor(ParticipantLevel$Picture_Type) #Make sure Picture_Type is a factor
+
+#Factor and reverse the order so that Anadrome is the first factor
+ParticipantLevel$trialtype <- factor(ParticipantLevel$trialtype, rev(levels(factor(ParticipantLevel$trialtype)))) 
+
+#Relabel the pictures types so the names look nicer in the figure 
+levels(ParticipantLevel$Picture_Type) <- list(Target="TARGET_IA", Competitor="COMPET_IA", Distractors="UNREL_IA")
+colnames(ParticipantLevel)[which(colnames(ParticipantLevel) %in% "Picture_Type")]<-"Picture Type"
+
+colorblindpalette <- c("#999999", "#56B4E9", "#009E73", "#0072B2", "#D55E00", "#CC79A7") #Selects a palette of color-blind friendly colors which are discriminable with most kinds of color blindness
+
+#Create facetted plot with both Anadrome and ACTCAT figures
+fig <- ggplot(ParticipantLevel, aes(x=time, y=Prob, color=`Picture Type`, shape=`Picture Type`)) +
+    geom_point(size=3) +
+    facet_grid(.~trialtype) +
+    geom_errorbar(aes(ymin=LCI, ymax=UCI)) +
+    scale_x_continuous(limits = c(0, 1250), name="time from spoken word onset (ms)")+
+    theme_bw()+
+    scale_fill_manual(values=colorblindpalette)+scale_colour_manual(values=colorblindpalette)+
+    scale_y_continuous(name="Fixation Proportion")+
+    theme(axis.title.x = element_text(face="bold", size=15), axis.text.x  = element_text(size=10))+
+    theme(axis.title.y = element_text(face="bold", size=15), axis.text.y  = element_text(size=10))+
+    theme(plot.title = element_text(lineheight=.8, face="bold", size=14))+
+    theme(strip.text.x = element_text(size=12, face="bold"))+
+    theme(legend.text = element_text(size = 12))+
+    theme(legend.title = element_text(size=12, face="bold"))+
+    theme(legend.title = element_text(size=12, face="bold"))
+
+fig #Display figure
+
+#Save the figure in the working directory in a high resolution format 
+ggsave(
+  "FixationCurves.png",
+  fig,
+  dpi=300,
+  height=5,
+  width=8
+)
+
+#Clean up
+rm(CleanData, CleanDataFigure, ParticipantLevel)
+```
+
+
+Perform analyses:
+
+
+We know from  the graphs above that the relationship between time and viewing of the pictures is non-linear. Here, we examine whether there is a reliable difference in viewing preferences between competitors and distractors, after accounting for participant and item random effects as well as the linear and non-linear effects of time. 
+
+```{r GLMM analyses}
+
+#Remove target picture - here we want to see if the competitors are looked at more than the unrelated distractors
+CleanDataLogistic <- CleanDataSubset %>% filter(Picture_Type!="TARGET_IA")
+
+#Set up competitor vs. distractors contrast
+CleanDataLogistic$Picture_Type <- factor(CleanDataLogistic$Picture_Type)
+cond.contrasts = t(MASS::ginv(matrix(c(1, -.5, -.5))))
+
+#Transform time to seconds just in case - in analyses using time it may cause a large eigenvector error since the scale is so big
+CleanDataLogistic$time2 <- CleanDataLogistic$time/1000
+
+#Here we calculate third-order orthogonal polynomials (linear, quadratic, and cubic) to account for the linear and non-linear effects of time
+#We use orthogonal polynomials because natural polynomials (e.g., time,  time^2) are correlated and thus interdependent
+t <- data.frame(poly(unique(CleanDataLogistic$time),3))
+t$time2 <- seq(0, 1.2, by=binsize/1000)
+
+#Add polynomials to data frame
+CleanDataLogistic <- merge(CleanDataLogistic , t, by="time2")
+
+#Fit GLMM to anadrome data and create a null comparison model without the picture type fixed effect
+#Note  that I use intercept-only random effects, as random slopes increased script runtime and do not change the inferential conclusions of these particular models
+full_lmer_anadrome = glmer(value ~ Picture_Type + X1+X2+X3 + (1|ParticipantID) + (1|target), family="binomial", contrasts=list(Picture_Type = cond.contrasts), data=CleanDataLogistic %>% filter(trialtype=="Anadrome"))
+#summary(full_lmer_anadrome) #Uncomment to print full model summary
+
+tab_model(full_lmer_anadrome, file ="AnadomeModel.html") #Write model to HTML formatted table
+
+##This model shows a reliable main effect of picture type, such that participants were more likely to look at the competitor than the distractors
+
+
+#Fit GLMM to ACTCAT data
+full_lmer_ACTCAT = glmer(value ~ Picture_Type + X1+X2+X3 + (1|ParticipantID) + (1|target), family="binomial", contrasts=list(Picture_Type = cond.contrasts), data=CleanDataLogistic %>% filter(trialtype=="ACTCAT"))
+#summary(full_lmer_ACTCAT) #Uncomment to print full model summary
+
+tab_model(full_lmer_ACTCAT, file ="ACTCATModel.html", show.r2=TRUE) #Write model to HTML formatted table
+
+##This model shows no significant main effect of picture type, such that participants were not significantly more likely to look at the competitor than the distractors
+
+```
+
+
+Although the pattern of effects is in line with our hypothesis, we are left with the the issue that our interpretation of the study hinges on accepting a null hypothesis, which is not licensed by conventional null hypothesis significance testing. However, it is possible to quantify evidence in favor of the null hypothesis using a Bayesian approach. Below, we computed Bayes factor by comparing the Bayesian Information Criterion (BIC) from our model to an identical model without picture type as a fixed effect using the formula recommended by Masson, 2011. 
+
+```{r Bayes factor and posterior probabilities}
+
+#create a null ACTCAT comparison model without the picture type fixed effect
+null_lmer_ACTCAT = update(full_lmer_ACTCAT, formula = ~ . -Picture_Type) 
+
+#Calculate Bayes Factor
+BF_BIC_ACTCAT = exp((BIC(full_lmer_ACTCAT) - BIC(null_lmer_ACTCAT))/2)  #Use ACTCAT model BICs to calculate Bayes Factor
+BF_BIC_ACTCAT #Print Bayes Factor
+
+#Calculate and print posterior probabilities in favor of H0 (note that this sums to 1 with the posterior probability of H1)
+#Guideline for interpretation (evidence in favor of): .5-.75 = weak; .75-.95 = positive; .95-.99 = strong; >.99 = very strong
+
+pp_ACTCAT <- BF_BIC_ACTCAT/(1+BF_BIC_ACTCAT)
+
+pp_ACTCAT #Print posterior probability for the ACTCAT model
+
+#In line with the guide above, the ACTCAT model shows "very strong" evidence in favor of the null hypothesis
+
+```
+
+
+```{r end}
+#For long-running scripts, this is a handy way to be notified when they are finished running without having to routinely check
+#install.packages("beepr")
+library(beepr)
+beep(3)
+```
+
